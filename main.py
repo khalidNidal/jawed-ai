@@ -1,7 +1,9 @@
 import os
 import io
-import soundfile as sf
+import threading
+import time
 import numpy as np
+import soundfile as sf
 import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
@@ -13,28 +15,46 @@ app = FastAPI()
 processor = None
 model = None
 device = "cpu"
+load_error = None
+loading = False
+
+def _load_model_bg():
+    global processor, model, device, load_error, loading
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
+        model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID).to(device)
+        model.eval()
+    except Exception as e:
+        load_error = str(e)
+    finally:
+        loading = False
 
 @app.on_event("startup")
-def load_model():
-    global processor, model, device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
-    model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID).to(device)
-    model.eval()
+def startup():
+    global loading
+    # شغّل التحميل بالخلفية عشان ما يمنع فتح البورت
+    loading = True
+    t = threading.Thread(target=_load_model_bg, daemon=True)
+    t.start()
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "loading": loading,
         "model_loaded": model is not None,
         "model_id": MODEL_ID,
-        "device": device
+        "device": device,
+        "error": load_error
     }
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
+    if load_error:
+        raise HTTPException(status_code=500, detail=f"Model load failed: {load_error}")
     if model is None or processor is None:
-        raise HTTPException(status_code=503, detail="Model is still loading")
+        raise HTTPException(status_code=503, detail="Model is still loading, try again shortly")
 
     data = await audio.read()
 
@@ -43,11 +63,9 @@ async def transcribe(audio: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid WAV file: {e}")
 
-    # لو stereo حوله mono
     if isinstance(wav, np.ndarray) and wav.ndim > 1:
         wav = wav.mean(axis=1)
 
-    # لازم 16kHz ل wav2vec2
     if sr != 16000:
         raise HTTPException(status_code=400, detail=f"Expected 16kHz WAV, got {sr}Hz")
 
