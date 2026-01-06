@@ -1,3 +1,4 @@
+import os
 import io
 import threading
 import numpy as np
@@ -7,6 +8,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 MODEL_ID = "ahmedAlawneh/wav2vec2-tajweed-juzamma"
+HF_TOKEN = os.getenv("HF_TOKEN")  # يتم تمريرها من Cloud Run (Secret/Env)
 
 app = FastAPI()
 
@@ -19,13 +21,25 @@ loading = False
 
 def _load_model_bg():
     global processor, model, device, load_error, loading
+
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
-        model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID).to(device)
+
+        # تحميل الموديل باستخدام HF_TOKEN لتجنب 429 rate limit
+        try:
+            # إصدارات جديدة تدعم token=
+            processor = Wav2Vec2Processor.from_pretrained(MODEL_ID, token=HF_TOKEN)
+            model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID, token=HF_TOKEN).to(device)
+        except TypeError:
+            # fallback لإصدارات أقدم: use_auth_token=
+            processor = Wav2Vec2Processor.from_pretrained(MODEL_ID, use_auth_token=HF_TOKEN)
+            model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID, use_auth_token=HF_TOKEN).to(device)
+
         model.eval()
+
     except Exception as e:
         load_error = str(e)
+
     finally:
         loading = False
 
@@ -33,6 +47,7 @@ def _load_model_bg():
 @app.on_event("startup")
 def startup():
     global loading
+    # تحميل بالخلفية حتى لا يمنع فتح البورت على Cloud Run
     loading = True
     t = threading.Thread(target=_load_model_bg, daemon=True)
     t.start()
@@ -47,6 +62,7 @@ def health():
         "model_id": MODEL_ID,
         "device": device,
         "error": load_error,
+        "has_hf_token": bool(HF_TOKEN),
     }
 
 
@@ -65,6 +81,7 @@ async def transcribe(audio: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid WAV file: {e}")
 
+    # لو ستيريو -> نحوله لمونو
     if isinstance(wav, np.ndarray) and wav.ndim > 1:
         wav = wav.mean(axis=1)
 
