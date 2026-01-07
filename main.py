@@ -1,6 +1,8 @@
 import os
 import io
 import threading
+import subprocess
+
 import numpy as np
 import soundfile as sf
 import torch
@@ -9,18 +11,28 @@ import joblib
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
+
+# =========================
+# Config
+# =========================
 MODEL_ID = os.getenv("MODEL_ID", "ahmedAlawneh/wav2vec2-tajweed-juzamma")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# SVM path داخل الصورة (Docker image)
 SVM_PATH = os.getenv("SVM_PATH", "models/svm_model.joblib")
 
-# Layer index للـ embedding
+# Embedding layer (hidden_states index)
 EMB_LAYER = int(os.getenv("EMB_LAYER", "11"))  # layer 11
-# mapping افتراضي (عدّلها من env لو احتجت)
+
+# ✅ حسب طلبك (معكوسة):
+# 0 -> wrong
+# 1 -> correct
 SVM_WRONG_VALUE = os.getenv("SVM_WRONG_VALUE", "0")
 SVM_CORRECT_VALUE = os.getenv("SVM_CORRECT_VALUE", "1")
 
+
+# =========================
+# App + Globals
+# =========================
 app = FastAPI()
 
 processor = None
@@ -35,45 +47,76 @@ svm_error = None
 svm_loading = False
 
 
-def _read_wav_bytes(data: bytes):
+# =========================
+# Audio helpers
+# =========================
+def _decode_any_audio_to_wav16k_mono(data: bytes) -> np.ndarray:
+    """
+    يقبل أي صيغة (mp3/m4a/wav/...) ويحوّل داخليًا لـ WAV mono 16kHz باستخدام ffmpeg
+    ويرجع waveform float32 جاهز للـ processor.
+    """
+    # 1) محاولة مباشرة (لو الملف WAV وsoundfile قادر يقرأه)
     try:
         wav, sr = sf.read(io.BytesIO(data))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid audio file: {e}")
+        if isinstance(wav, np.ndarray) and wav.ndim > 1:
+            wav = wav.mean(axis=1)  # stereo -> mono
+        if sr == 16000:
+            return wav.astype(np.float32, copy=False)
+        # إذا WAV لكن sample rate مختلف -> بنحوّل عبر ffmpeg
+    except Exception:
+        pass
 
-    # stereo -> mono
+    # 2) تحويل عبر ffmpeg (يدعم mp3/m4a وغيره)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", "pipe:0",
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "wav",
+        "pipe:1"
+    ]
+
+    p = subprocess.run(
+        cmd,
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
+    )
+
+    if p.returncode != 0 or not p.stdout:
+        err = p.stderr.decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=400, detail=f"ffmpeg decode failed: {err[:400]}")
+
+    wav, sr = sf.read(io.BytesIO(p.stdout))
     if isinstance(wav, np.ndarray) and wav.ndim > 1:
         wav = wav.mean(axis=1)
 
     if sr != 16000:
-        raise HTTPException(status_code=400, detail=f"Expected 16kHz WAV, got {sr}Hz")
+        raise HTTPException(status_code=500, detail=f"Internal decode produced {sr}Hz (expected 16000Hz)")
 
-    # float32
-    wav = wav.astype(np.float32, copy=False)
-    return wav, sr
+    return wav.astype(np.float32, copy=False)
 
 
+# =========================
+# SVM helpers
+# =========================
 def _map_label(raw):
-    # لو كان الكلاسيفاير أصلاً يرجّع wrong/correct
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s in ("wrong", "incorrect", "bad", "false"):
-            return "wrong"
-        if s in ("correct", "right", "good", "true"):
-            return "correct"
-        # numeric as string
-        if s == str(SVM_WRONG_VALUE).strip().lower():
-            return "wrong"
-        if s == str(SVM_CORRECT_VALUE).strip().lower():
-            return "correct"
-        return raw  # fallback
-
-    # numeric
+    """
+    يحوّل خرج SVM إلى wrong/correct حسب env vars.
+    """
     s = str(raw).strip().lower()
     if s == str(SVM_WRONG_VALUE).strip().lower():
         return "wrong"
     if s == str(SVM_CORRECT_VALUE).strip().lower():
         return "correct"
+
+    # fallback لو كان أصلاً نص
+    if s in ("wrong", "incorrect", "bad", "false"):
+        return "wrong"
+    if s in ("correct", "right", "good", "true"):
+        return "correct"
+
     return str(raw)
 
 
@@ -86,61 +129,61 @@ def _softmax(x: np.ndarray):
 
 def _svm_predict_with_confidence(vec_2d: np.ndarray):
     """
-    vec_2d shape: (1, D)
+    vec_2d: shape (1, D)
     Returns: raw_label, confidence(float)
     """
     if svm_model is None:
         raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
 
-    # Predict label
     raw = svm_model.predict(vec_2d)[0]
 
-    # Confidence
     conf = None
     if hasattr(svm_model, "predict_proba"):
-        probs = svm_model.predict_proba(vec_2d)[0]  # shape (C,)
+        probs = svm_model.predict_proba(vec_2d)[0]
         idx = int(np.argmax(probs))
         raw = svm_model.classes_[idx]
         conf = float(probs[idx])
     elif hasattr(svm_model, "decision_function"):
         df = svm_model.decision_function(vec_2d)
         df = np.asarray(df)
-        # binary: shape (1,) or (1,1)
+
+        # binary
         if df.ndim == 1 or (df.ndim == 2 and df.shape[1] == 1):
             score = float(df.reshape(-1)[0])
-            # sigmoid تقريب
-            conf = float(1.0 / (1.0 + np.exp(-score)))
+            conf = float(1.0 / (1.0 + np.exp(-score)))  # sigmoid approx
         else:
-            # multi-class: softmax على الـ scores
             probs = _softmax(df.reshape(-1))
             idx = int(np.argmax(probs))
             raw = svm_model.classes_[idx]
             conf = float(probs[idx])
     else:
-        # ما في طريقة ثقة واضحة
         conf = 0.0
 
     return raw, conf
 
 
-def _extract_embedding_from_hidden_states(hidden_states: tuple, layer_index: int):
+# =========================
+# Embedding extraction
+# =========================
+def _extract_embedding_mean_std(hidden_states: tuple, layer_index: int) -> torch.Tensor:
     """
     hidden_states: tuple of tensors [B, T, H]
-    mean+std => (B, 2H)
+    mean+std => (B, 2H) (هنا 2048)
     """
     if not hidden_states:
         raise RuntimeError("No hidden_states returned from model")
 
-    # clamp layer index
     li = max(0, min(layer_index, len(hidden_states) - 1))
-    hs = hidden_states[li]  # [B, T, H]
-
-    mean = hs.mean(dim=1)  # [B, H]
-    std = hs.std(dim=1, unbiased=False)  # [B, H]
-    emb = torch.cat([mean, std], dim=-1)  # [B, 2H]
+    hs = hidden_states[li]              # [B, T, H]
+    mean = hs.mean(dim=1)               # [B, H]
+    std = hs.std(dim=1, unbiased=False) # [B, H]
+    emb = torch.cat([mean, std], dim=-1)# [B, 2H]
     return emb
 
 
+# =========================
+# Background loading
+# =========================
 def _load_all_bg():
     global processor, model, device, load_error, loading
     global svm_model, svm_error, svm_loading
@@ -183,6 +226,9 @@ def startup():
     t.start()
 
 
+# =========================
+# Endpoints
+# =========================
 @app.get("/health")
 def health():
     return {
@@ -201,6 +247,7 @@ def health():
         "emb_layer": EMB_LAYER,
         "svm_wrong_value": SVM_WRONG_VALUE,
         "svm_correct_value": SVM_CORRECT_VALUE,
+        "audio_auto_convert": True,
     }
 
 
@@ -212,13 +259,12 @@ async def transcribe(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Model is still loading, try again shortly")
 
     data = await audio.read()
-    wav, _ = _read_wav_bytes(data)
+    wav = _decode_any_audio_to_wav16k_mono(data)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
     with torch.no_grad():
-        out = model(inputs.input_values.to(device))
-        logits = out.logits
+        logits = model(inputs.input_values.to(device)).logits
         pred_ids = torch.argmax(logits, dim=-1)
         text = processor.batch_decode(pred_ids)[0]
 
@@ -237,7 +283,7 @@ async def classify(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
 
     data = await audio.read()
-    wav, _ = _read_wav_bytes(data)
+    wav = _decode_any_audio_to_wav16k_mono(data)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -247,14 +293,14 @@ async def classify(audio: UploadFile = File(...)):
             output_hidden_states=True,
             return_dict=True
         )
-        emb_t = _extract_embedding_from_hidden_states(out.hidden_states, EMB_LAYER)  # [1, 2H]
+        emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)  # [1, 2048]
         emb = emb_t.detach().cpu().numpy().astype(np.float32)
 
     raw_label, conf = _svm_predict_with_confidence(emb)
-    mapped = _map_label(raw_label)
+    label = _map_label(raw_label)
 
     return {
-        "label": mapped,
+        "label": label,
         "raw_label": str(raw_label),
         "confidence": float(conf),
     }
@@ -263,11 +309,9 @@ async def classify(audio: UploadFile = File(...)):
 @app.post("/predict")
 async def predict(audio: UploadFile = File(...)):
     """
-    Endpoint واحد يجمع:
-    - transcription
-    - wrong/correct classification
-    - confidence
-    ويشغّل الموديل مرة واحدة (logits + hidden_states).
+    Endpoint واحد:
+    - transcribe + classify
+    - نفس forward pass (logits + hidden_states)
     """
     if load_error:
         raise HTTPException(status_code=500, detail=f"Model load failed: {load_error}")
@@ -279,7 +323,7 @@ async def predict(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
 
     data = await audio.read()
-    wav, _ = _read_wav_bytes(data)
+    wav = _decode_any_audio_to_wav16k_mono(data)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -296,15 +340,15 @@ async def predict(audio: UploadFile = File(...)):
         text = processor.batch_decode(pred_ids)[0]
 
         # (2) embedding + svm
-        emb_t = _extract_embedding_from_hidden_states(out.hidden_states, EMB_LAYER)
+        emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)
         emb = emb_t.detach().cpu().numpy().astype(np.float32)
 
     raw_label, conf = _svm_predict_with_confidence(emb)
-    mapped = _map_label(raw_label)
+    label = _map_label(raw_label)
 
     return {
         "text": text,
-        "label": mapped,          # wrong/correct
+        "label": label,
         "raw_label": str(raw_label),
         "confidence": float(conf),
     }
