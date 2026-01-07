@@ -2,6 +2,8 @@ import os
 import io
 import threading
 import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -53,10 +55,14 @@ svm_loading = False
 # =========================
 # Audio helpers
 # =========================
-def _decode_any_audio_to_wav16k_mono(data: bytes) -> np.ndarray:
+def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -> np.ndarray:
     """
     يقبل أي صيغة (mp3/m4a/wav/...) ويحوّل داخليًا لـ WAV mono 16kHz باستخدام ffmpeg
     ويرجع waveform float32 جاهز للـ processor.
+
+    IMPORTANT:
+    بعض ملفات m4a/mp4 تحتاج input seekable (ملف على الديسك)،
+    لذلك نكتب data لملف مؤقت في /tmp بدل pipe:0.
     """
     # 1) محاولة مباشرة (لو الملف WAV وsoundfile قادر يقرأه)
     try:
@@ -69,46 +75,78 @@ def _decode_any_audio_to_wav16k_mono(data: bytes) -> np.ndarray:
     except Exception:
         pass
 
-    # 2) تحويل عبر ffmpeg (يدعم mp3/m4a وغيره)
-    # -vn لتجاهل الفيديو (لو الملف فيديو/مرفق فيديو)
-    # -map a:0? لاختيار أول مسار صوت إن وجد
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", "pipe:0",
-        "-vn",
-        "-map", "a:0?",
-        "-ac", "1",
-        "-ar", "16000",
-        "-f", "wav",
-        "pipe:1"
-    ]
+    suffix = ""
+    if filename:
+        try:
+            suf = Path(filename).suffix
+            if 1 <= len(suf) <= 10:
+                suffix = suf
+        except Exception:
+            suffix = ""
+
+    in_path = None
+    out_path = None
 
     try:
-        p = subprocess.run(
-            cmd,
-            input=data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False
-        )
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg not found in container. Please install ffmpeg in Dockerfile and redeploy."
-        )
+        # 2) اكتب الملف على /tmp (seekable)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin") as f:
+            f.write(data)
+            in_path = f.name
 
-    if p.returncode != 0 or not p.stdout:
-        err = p.stderr.decode("utf-8", errors="ignore")
-        raise HTTPException(status_code=400, detail=f"ffmpeg decode failed: {err[:400]}")
+        # output wav path
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
 
-    wav, sr = sf.read(io.BytesIO(p.stdout))
-    if isinstance(wav, np.ndarray) and wav.ndim > 1:
-        wav = wav.mean(axis=1)
+        # 3) تحويل عبر ffmpeg (يدعم mp3/m4a وغيره)
+        # -vn لتجاهل الفيديو
+        # -sn/-dn لتجاهل subs/data streams
+        cmd = [
+            "ffmpeg", "-y",
+            "-hide_banner", "-loglevel", "error",
+            "-i", in_path,
+            "-vn", "-sn", "-dn",
+            "-ac", "1",
+            "-ar", "16000",
+            out_path
+        ]
 
-    if sr != 16000:
-        raise HTTPException(status_code=500, detail=f"Internal decode produced {sr}Hz (expected 16000Hz)")
+        try:
+            p = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False
+            )
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg not found in container. Please install ffmpeg in Dockerfile and redeploy."
+            )
 
-    return wav.astype(np.float32, copy=False)
+        if p.returncode != 0:
+            err = p.stderr.decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=400, detail=f"ffmpeg decode failed: {err[:400]}")
+
+        wav, sr = sf.read(out_path)
+        if isinstance(wav, np.ndarray) and wav.ndim > 1:
+            wav = wav.mean(axis=1)
+
+        if sr != 16000:
+            raise HTTPException(status_code=500, detail=f"Internal decode produced {sr}Hz (expected 16000Hz)")
+
+        return wav.astype(np.float32, copy=False)
+
+    finally:
+        # cleanup temp files
+        try:
+            if in_path and os.path.exists(in_path):
+                os.remove(in_path)
+        except Exception:
+            pass
+        try:
+            if out_path and os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
 
 
 def _ensure_audio_ok(wav: np.ndarray) -> np.ndarray:
@@ -216,7 +254,7 @@ def _extract_embedding_mean_std(hidden_states: tuple, layer_index: int) -> torch
     hs = hidden_states[li]              # [B, T, H]
     mean = hs.mean(dim=1)               # [B, H]
     std = hs.std(dim=1, unbiased=False) # [B, H]
-    emb = torch.cat([mean, std], dim=-1)# [B, 2H]
+    emb = torch.cat([mean, std], dim=-1)  # [B, 2H]
     return emb
 
 
@@ -300,8 +338,8 @@ async def transcribe(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Model is still loading, try again shortly")
 
     data = await audio.read()
-    wav = _decode_any_audio_to_wav16k_mono(data)
-    wav = _ensure_audio_ok(wav)  # ✅ مهم
+    wav = _decode_any_audio_to_wav16k_mono(data, audio.filename)
+    wav = _ensure_audio_ok(wav)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -325,8 +363,8 @@ async def classify(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
 
     data = await audio.read()
-    wav = _decode_any_audio_to_wav16k_mono(data)
-    wav = _ensure_audio_ok(wav)  # ✅ مهم
+    wav = _decode_any_audio_to_wav16k_mono(data, audio.filename)
+    wav = _ensure_audio_ok(wav)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -366,8 +404,8 @@ async def predict(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
 
     data = await audio.read()
-    wav = _decode_any_audio_to_wav16k_mono(data)
-    wav = _ensure_audio_ok(wav)  # ✅ مهم
+    wav = _decode_any_audio_to_wav16k_mono(data, audio.filename)
+    wav = _ensure_audio_ok(wav)
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
