@@ -29,6 +29,9 @@ EMB_LAYER = int(os.getenv("EMB_LAYER", "11"))  # layer 11
 SVM_WRONG_VALUE = os.getenv("SVM_WRONG_VALUE", "0")
 SVM_CORRECT_VALUE = os.getenv("SVM_CORRECT_VALUE", "1")
 
+# Minimum audio duration after decoding (seconds)
+MIN_AUDIO_SEC = float(os.getenv("MIN_AUDIO_SEC", "0.5"))
+
 
 # =========================
 # App + Globals
@@ -67,22 +70,32 @@ def _decode_any_audio_to_wav16k_mono(data: bytes) -> np.ndarray:
         pass
 
     # 2) تحويل عبر ffmpeg (يدعم mp3/m4a وغيره)
+    # -vn لتجاهل الفيديو (لو الملف فيديو/مرفق فيديو)
+    # -map a:0? لاختيار أول مسار صوت إن وجد
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", "pipe:0",
+        "-vn",
+        "-map", "a:0?",
         "-ac", "1",
         "-ar", "16000",
         "-f", "wav",
         "pipe:1"
     ]
 
-    p = subprocess.run(
-        cmd,
-        input=data,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False
-    )
+    try:
+        p = subprocess.run(
+            cmd,
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg not found in container. Please install ffmpeg in Dockerfile and redeploy."
+        )
 
     if p.returncode != 0 or not p.stdout:
         err = p.stderr.decode("utf-8", errors="ignore")
@@ -96,6 +109,32 @@ def _decode_any_audio_to_wav16k_mono(data: bytes) -> np.ndarray:
         raise HTTPException(status_code=500, detail=f"Internal decode produced {sr}Hz (expected 16000Hz)")
 
     return wav.astype(np.float32, copy=False)
+
+
+def _ensure_audio_ok(wav: np.ndarray) -> np.ndarray:
+    """
+    يمنع Crash (Kernel size > input) إذا الصوت طلع فاضي/قصير بعد التحويل.
+    """
+    if wav is None or not isinstance(wav, np.ndarray) or wav.size == 0:
+        raise HTTPException(status_code=400, detail="Audio is empty after decoding. Please record again.")
+
+    # تأكد 1D
+    if wav.ndim != 1:
+        wav = wav.reshape(-1)
+
+    min_samples = int(16000 * MIN_AUDIO_SEC)
+    if wav.size < min_samples:
+        dur = wav.size / 16000.0
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio too short ({dur:.3f}s). Need at least {MIN_AUDIO_SEC:.1f}s."
+        )
+
+    # تنظيف NaN/Inf إن وجدت
+    if not np.isfinite(wav).all():
+        wav = np.nan_to_num(wav)
+
+    return wav
 
 
 # =========================
@@ -247,7 +286,9 @@ def health():
         "emb_layer": EMB_LAYER,
         "svm_wrong_value": SVM_WRONG_VALUE,
         "svm_correct_value": SVM_CORRECT_VALUE,
+
         "audio_auto_convert": True,
+        "min_audio_sec": MIN_AUDIO_SEC,
     }
 
 
@@ -260,6 +301,7 @@ async def transcribe(audio: UploadFile = File(...)):
 
     data = await audio.read()
     wav = _decode_any_audio_to_wav16k_mono(data)
+    wav = _ensure_audio_ok(wav)  # ✅ مهم
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -284,6 +326,7 @@ async def classify(audio: UploadFile = File(...)):
 
     data = await audio.read()
     wav = _decode_any_audio_to_wav16k_mono(data)
+    wav = _ensure_audio_ok(wav)  # ✅ مهم
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
@@ -324,6 +367,7 @@ async def predict(audio: UploadFile = File(...)):
 
     data = await audio.read()
     wav = _decode_any_audio_to_wav16k_mono(data)
+    wav = _ensure_audio_ok(wav)  # ✅ مهم
 
     inputs = processor(wav, sampling_rate=16000, return_tensors="pt", padding=True)
 
