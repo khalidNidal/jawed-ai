@@ -18,8 +18,8 @@ SVM_PATH = os.getenv("SVM_PATH", "models/svm_model.joblib")
 # Layer index للـ embedding
 EMB_LAYER = int(os.getenv("EMB_LAYER", "11"))  # layer 11
 # mapping افتراضي (عدّلها من env لو احتجت)
-SVM_WRONG_VALUE = os.getenv("SVM_WRONG_VALUE", "1")
-SVM_CORRECT_VALUE = os.getenv("SVM_CORRECT_VALUE", "0")
+SVM_WRONG_VALUE = os.getenv("SVM_WRONG_VALUE", "0")
+SVM_CORRECT_VALUE = os.getenv("SVM_CORRECT_VALUE", "1")
 
 app = FastAPI()
 
