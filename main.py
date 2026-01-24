@@ -36,7 +36,7 @@ MIN_AUDIO_SEC = float(os.getenv("MIN_AUDIO_SEC", "0.5"))
 
 # Tajweed annotations JSON (optional)
 TAJWEED_PATH = os.getenv("TAJWEED_PATH", "")
-IQLAB_MARGIN_BEFORE = float(os.getenv("IQLAB_MARGIN_BEFORE", "1.0"))
+IQLAB_MARGIN_BEFORE = float(os.getenv("IQLAB_MARGIN_BEFORE", "2.0"))
 IQLAB_MARGIN_AFTER = float(os.getenv("IQLAB_MARGIN_AFTER", "1.0"))
 
 
