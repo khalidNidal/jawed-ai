@@ -9,8 +9,9 @@ import numpy as np
 import soundfile as sf
 import torch
 import joblib
+import json
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 
@@ -34,6 +35,11 @@ SVM_CORRECT_VALUE = os.getenv("SVM_CORRECT_VALUE", "1")
 # Minimum audio duration after decoding (seconds)
 MIN_AUDIO_SEC = float(os.getenv("MIN_AUDIO_SEC", "0.5"))
 
+# Tajweed annotations JSON (optional)
+TAJWEED_PATH = os.getenv("TAJWEED_PATH", "")
+IQLAB_MARGIN_BEFORE = float(os.getenv("IQLAB_MARGIN_BEFORE", "1.0"))
+IQLAB_MARGIN_AFTER = float(os.getenv("IQLAB_MARGIN_AFTER", "1.0"))
+
 
 # =========================
 # App + Globals
@@ -50,6 +56,11 @@ loading = False
 
 svm_error = None
 svm_loading = False
+
+# Tajweed data globals
+tajweed_data = None
+# (surah, ayah) -> list[annotations]
+tajweed_index = {}
 
 
 # =========================
@@ -106,7 +117,7 @@ def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -
             "-vn", "-sn", "-dn",
             "-ac", "1",
             "-ar", "16000",
-            out_path
+            out_path,
         ]
 
         try:
@@ -114,12 +125,12 @@ def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                check=False
+                check=False,
             )
         except FileNotFoundError:
             raise HTTPException(
                 status_code=500,
-                detail="ffmpeg not found in container. Please install ffmpeg in Dockerfile and redeploy."
+                detail="ffmpeg not found in container. Please install ffmpeg in Dockerfile and redeploy.",
             )
 
         if p.returncode != 0:
@@ -151,7 +162,8 @@ def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -
 
 def _ensure_audio_ok(wav: np.ndarray) -> np.ndarray:
     """
-    يمنع Crash (Kernel size > input) إذا الصوت طلع فاضي/قصير بعد التحويل.
+    يمنع Crash (Kernel size > input)
+    إذا الصوت طلع فاضي/قصير بعد التحويل.
     """
     if wav is None or not isinstance(wav, np.ndarray) or wav.size == 0:
         raise HTTPException(status_code=400, detail="Audio is empty after decoding. Please record again.")
@@ -165,12 +177,13 @@ def _ensure_audio_ok(wav: np.ndarray) -> np.ndarray:
         dur = wav.size / 16000.0
         raise HTTPException(
             status_code=400,
-            detail=f"Audio too short ({dur:.3f}s). Need at least {MIN_AUDIO_SEC:.1f}s."
+            detail=f"Audio too short ({dur:.3f}s). Need at least {MIN_AUDIO_SEC:.1f}s.",
         )
 
-    # تنظيف NaN/Inf إن وجدت
-    if not np.isfinite(wav).all():
-        wav = np.nan_to_num(wav)
+    # normalize to [-1, 1] if needed
+    max_abs = np.max(np.abs(wav))
+    if max_abs > 0:
+        wav = wav.astype(np.float32, copy=False) / float(max_abs + 1e-9)
 
     return wav
 
@@ -204,13 +217,40 @@ def _softmax(x: np.ndarray):
     return e / (np.sum(e) + 1e-12)
 
 
-def _svm_predict_with_confidence(vec_2d: np.ndarray):
+def _extract_embedding_mean_std(hidden_states, layer_index: int) -> torch.Tensor:
     """
-    vec_2d: shape (1, D)
-    Returns: raw_label, confidence(float)
+    يأخذ hidden_states (list of Tensors) ويستخرج embedding من layer معيّن:
+    - نأخذ mean و std على طول الزمن
+    - ندمجهم -> [batch, 2 * hidden_size]
+    """
+    if not hidden_states:
+        raise HTTPException(status_code=500, detail="Model did not return hidden_states.")
+
+    if layer_index < 0 or layer_index >= len(hidden_states):
+        raise HTTPException(status_code=500, detail=f"Invalid EMB_LAYER index {layer_index}")
+
+    hs = hidden_states[layer_index]  # [batch, time, dim]
+    if hs.ndim != 3:
+        raise HTTPException(status_code=500, detail="Unexpected hidden_states shape.")
+
+    mean = hs.mean(dim=1)
+    std = hs.std(dim=1)
+    emb = torch.cat([mean, std], dim=-1)
+    return emb  # [batch, 2 * dim]
+
+
+def _svm_predict_with_confidence(emb: np.ndarray):
+    """
+    emb: [1, dim]
+    يرجع (raw_label, confidence)
     """
     if svm_model is None:
-        raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
+        raise HTTPException(status_code=503, detail="SVM is not loaded yet.")
+
+    if emb.ndim == 1:
+        vec_2d = emb.reshape(1, -1)
+    else:
+        vec_2d = emb
 
     raw = svm_model.predict(vec_2d)[0]
 
@@ -229,33 +269,11 @@ def _svm_predict_with_confidence(vec_2d: np.ndarray):
             score = float(df.reshape(-1)[0])
             conf = float(1.0 / (1.0 + np.exp(-score)))  # sigmoid approx
         else:
-            probs = _softmax(df.reshape(-1))
-            idx = int(np.argmax(probs))
+            idx = int(np.argmax(df))
             raw = svm_model.classes_[idx]
-            conf = float(probs[idx])
-    else:
-        conf = 0.0
+            conf = float(_softmax(df.reshape(-1))[idx])
 
     return raw, conf
-
-
-# =========================
-# Embedding extraction
-# =========================
-def _extract_embedding_mean_std(hidden_states: tuple, layer_index: int) -> torch.Tensor:
-    """
-    hidden_states: tuple of tensors [B, T, H]
-    mean+std => (B, 2H) (هنا 2048)
-    """
-    if not hidden_states:
-        raise RuntimeError("No hidden_states returned from model")
-
-    li = max(0, min(layer_index, len(hidden_states) - 1))
-    hs = hidden_states[li]              # [B, T, H]
-    mean = hs.mean(dim=1)               # [B, H]
-    std = hs.std(dim=1, unbiased=False) # [B, H]
-    emb = torch.cat([mean, std], dim=-1)  # [B, 2H]
-    return emb
 
 
 # =========================
@@ -265,25 +283,23 @@ def _load_all_bg():
     global processor, model, device, load_error, loading
     global svm_model, svm_error, svm_loading
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load HF model
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Load HF model
-        try:
-            processor = Wav2Vec2Processor.from_pretrained(MODEL_ID, token=HF_TOKEN)
-            model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID, token=HF_TOKEN).to(device)
-        except TypeError:
-            processor = Wav2Vec2Processor.from_pretrained(MODEL_ID, use_auth_token=HF_TOKEN)
-            model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID, use_auth_token=HF_TOKEN).to(device)
-
-        model.eval()
-
+        processor = Wav2Vec2Processor.from_pretrained(MODEL_ID, token=HF_TOKEN)
+        model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID, token=HF_TOKEN).to(device)
+        load_error = None
     except Exception as e:
         load_error = str(e)
+        processor = None
+        model = None
+        loading = False
+        svm_loading = False
+        return
 
-    # Load SVM
+    # Load SVM model
     try:
-        svm_loading = True
         svm_model = joblib.load(SVM_PATH)
         svm_error = None
     except Exception as e:
@@ -294,11 +310,63 @@ def _load_all_bg():
         loading = False
 
 
+def _load_tajweed():
+    """Load tajweed annotations JSON into memory (if TAJWEED_PATH is set)."""
+    global tajweed_data, tajweed_index
+    tajweed_data = None
+    tajweed_index = {}
+    if not TAJWEED_PATH:
+        # optional – if not provided, features depending on it will just return empty spans
+        print("TAJWEED_PATH not set; tajweed-based features will be disabled.")
+        return
+    try:
+        with open(TAJWEED_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tajweed_data = data
+        idx = {}
+        for entry in data:
+            try:
+                surah = entry.get("surah")
+                ayah = entry.get("ayah")
+            except AttributeError:
+                continue
+            if surah is None or ayah is None:
+                continue
+            ann = entry.get("annotations") or []
+            idx[(int(surah), int(ayah))] = ann
+        tajweed_index = idx
+        print(f"Loaded tajweed data from {TAJWEED_PATH}, entries={len(tajweed_index)}")
+    except FileNotFoundError:
+        print(f"TAJWEED_PATH file not found: {TAJWEED_PATH}")
+    except Exception as e:
+        print(f"Error loading tajweed data from {TAJWEED_PATH}: {e}")
+
+
+def get_iqlab_spans(surah: int, ayah: int):
+    """Return list of iqlab spans for (surah, ayah) from tajweed_index.
+
+    Each span is the original dict from the JSON (includes rule, start, end, ...).
+    If tajweed data is not loaded or no entries exist, returns [].
+    """
+    if not tajweed_index:
+        return []
+    try:
+        key = (int(surah), int(ayah))
+    except Exception:
+        return []
+    annots = tajweed_index.get(key, []) or []
+    return [a for a in annots if str(a.get("rule")).lower() == "iqlab"]
+
+
 @app.on_event("startup")
 def startup():
     global loading, svm_loading
     loading = True
     svm_loading = True
+
+    # Load tajweed annotations (if configured) before starting the model loader thread
+    _load_tajweed()
+
     t = threading.Thread(target=_load_all_bg, daemon=True)
     t.start()
 
@@ -315,16 +383,12 @@ def health():
         "model_id": MODEL_ID,
         "device": device,
         "error": load_error,
-        "has_hf_token": bool(HF_TOKEN),
-
         "svm_loaded": svm_model is not None,
         "svm_loading": svm_loading,
         "svm_error": svm_error,
-
         "emb_layer": EMB_LAYER,
         "svm_wrong_value": SVM_WRONG_VALUE,
         "svm_correct_value": SVM_CORRECT_VALUE,
-
         "audio_auto_convert": True,
         "min_audio_sec": MIN_AUDIO_SEC,
     }
@@ -372,7 +436,7 @@ async def classify(audio: UploadFile = File(...)):
         out = model(
             inputs.input_values.to(device),
             output_hidden_states=True,
-            return_dict=True
+            return_dict=True,
         )
         emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)  # [1, 2048]
         emb = emb_t.detach().cpu().numpy().astype(np.float32)
@@ -413,7 +477,7 @@ async def predict(audio: UploadFile = File(...)):
         out = model(
             inputs.input_values.to(device),
             output_hidden_states=True,
-            return_dict=True
+            return_dict=True,
         )
 
         # (1) transcription
@@ -433,4 +497,140 @@ async def predict(audio: UploadFile = File(...)):
         "label": label,
         "raw_label": str(raw_label),
         "confidence": float(conf),
+    }
+
+
+@app.post("/analyze_ayah")
+async def analyze_ayah(
+    audio: UploadFile = File(...),
+    surah: int = Form(...),
+    ayah: int = Form(...),
+):
+    """Analyze a full ayah recitation.
+
+    This endpoint:
+    - looks up iqlab spans for (surah, ayah) from tajweed annotations
+    - decodes the full audio
+    - approximates a time window around each span
+    - crops each window and runs the existing SVM classifier on it
+
+    NOTE:
+    The current time mapping is a simple linear approximation over the ayah text
+    based on the span indices. For production, you should replace this with a
+    proper ASR + alignment pipeline to get precise timestamps.
+    """
+    if load_error:
+        raise HTTPException(status_code=500, detail=f"Model load failed: {load_error}")
+    if model is None or processor is None:
+        raise HTTPException(status_code=503, detail="Model is still loading, try again shortly")
+    if svm_error:
+        raise HTTPException(status_code=500, detail=f"SVM load failed: {svm_error}")
+    if svm_model is None:
+        raise HTTPException(status_code=503, detail="SVM is still loading, try again shortly")
+
+    # 1) decode & sanity-check audio
+    data = await audio.read()
+    wav = _decode_any_audio_to_wav16k_mono(data, audio.filename)
+    wav = _ensure_audio_ok(wav)
+    sample_rate = 16000
+    duration = float(wav.size) / float(sample_rate)
+
+    # 2) get iqlab spans for this ayah
+    spans = get_iqlab_spans(surah, ayah)
+    if not spans:
+        return {
+            "surah": surah,
+            "ayah": ayah,
+            "duration": duration,
+            "iqlab_spans": [],
+            "segments": [],
+            "margin_before": IQLAB_MARGIN_BEFORE,
+            "margin_after": IQLAB_MARGIN_AFTER,
+            "note": "No iqlab spans found for this ayah or tajweed data not loaded.",
+        }
+
+    # determine a rough max index to normalise time mapping
+    max_end = 0
+    for s in spans:
+        try:
+            e = int(s.get("end", 0))
+        except Exception:
+            e = 0
+        if e > max_end:
+            max_end = e
+    if max_end <= 0:
+        max_end = 1  # avoid division by zero
+
+    segments = []
+    for span in spans:
+        try:
+            start_idx = int(span.get("start", 0))
+        except Exception:
+            start_idx = 0
+        try:
+            end_idx = int(span.get("end", start_idx))
+        except Exception:
+            end_idx = start_idx
+
+        center_idx = 0.5 * (start_idx + end_idx)
+        # simple linear mapping: character position -> time within the ayah
+        core_time = (center_idx / float(max_end)) * duration
+
+        # expand with margins to be safe
+        t_start = core_time - IQLAB_MARGIN_BEFORE
+        t_end = core_time + IQLAB_MARGIN_AFTER
+
+        # clamp to audio bounds
+        if t_start < 0.0:
+            t_start = 0.0
+        if t_end > duration:
+            t_end = duration
+        if t_end <= t_start:
+            # fallback to a tiny window around the core_time
+            t_start = max(0.0, core_time - 0.1)
+            t_end = min(duration, core_time + 0.1)
+
+        start_sample = int(t_start * sample_rate)
+        end_sample = int(t_end * sample_rate)
+        seg_wav = wav[start_sample:end_sample]
+        # ensure the cropped segment is still valid
+        seg_wav = _ensure_audio_ok(seg_wav)
+
+        # 3) classify this segment with the existing SVM pipeline
+        inputs = processor(seg_wav, sampling_rate=sample_rate, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            out = model(
+                inputs.input_values.to(device),
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)
+        emb = emb_t.detach().cpu().numpy().astype(np.float32)
+        raw_label, conf = _svm_predict_with_confidence(emb)
+        label = _map_label(raw_label)
+
+        segments.append(
+            {
+                "span": {
+                    "rule": span.get("rule"),
+                    "start": start_idx,
+                    "end": end_idx,
+                },
+                "t_start": t_start,
+                "t_end": t_end,
+                "label": label,
+                "raw_label": str(raw_label),
+                "confidence": float(conf),
+            }
+        )
+
+    return {
+        "surah": surah,
+        "ayah": ayah,
+        "duration": duration,
+        "iqlab_spans": spans,
+        "segments": segments,
+        "margin_before": IQLAB_MARGIN_BEFORE,
+        "margin_after": IQLAB_MARGIN_AFTER,
+        "note": "Segments were derived using a simple linear mapping from span indices to time. Replace with real ASR alignment for higher precision.",
     }
