@@ -26,7 +26,6 @@ SVM_PATH = os.getenv("SVM_PATH", "models/svm_model.joblib")
 # Embedding layer (hidden_states index)
 EMB_LAYER = int(os.getenv("EMB_LAYER", "11"))  # layer 11
 
-# ✅ حسب طلبك (معكوسة):
 # 0 -> wrong
 # 1 -> correct
 SVM_WRONG_VALUE = os.getenv("SVM_WRONG_VALUE", "0")
@@ -70,10 +69,6 @@ def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -
     """
     يقبل أي صيغة (mp3/m4a/wav/...) ويحوّل داخليًا لـ WAV mono 16kHz باستخدام ffmpeg
     ويرجع waveform float32 جاهز للـ processor.
-
-    IMPORTANT:
-    بعض ملفات m4a/mp4 تحتاج input seekable (ملف على الديسك)،
-    لذلك نكتب data لملف مؤقت في /tmp بدل pipe:0.
     """
     # 1) محاولة مباشرة (لو الملف WAV وsoundfile قادر يقرأه)
     try:
@@ -108,8 +103,6 @@ def _decode_any_audio_to_wav16k_mono(data: bytes, filename: str | None = None) -
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
 
         # 3) تحويل عبر ffmpeg (يدعم mp3/m4a وغيره)
-        # -vn لتجاهل الفيديو
-        # -sn/-dn لتجاهل subs/data streams
         cmd = [
             "ffmpeg", "-y",
             "-hide_banner", "-loglevel", "error",
@@ -316,7 +309,6 @@ def _load_tajweed():
     tajweed_data = None
     tajweed_index = {}
     if not TAJWEED_PATH:
-        # optional – if not provided, features depending on it will just return empty spans
         print("TAJWEED_PATH not set; tajweed-based features will be disabled.")
         return
     try:
@@ -343,11 +335,7 @@ def _load_tajweed():
 
 
 def get_iqlab_spans(surah: int, ayah: int):
-    """Return list of iqlab spans for (surah, ayah) from tajweed_index.
-
-    Each span is the original dict from the JSON (includes rule, start, end, ...).
-    If tajweed data is not loaded or no entries exist, returns [].
-    """
+    """Return list of iqlab spans for (surah, ayah) from tajweed_index."""
     if not tajweed_index:
         return []
     try:
@@ -364,7 +352,6 @@ def startup():
     loading = True
     svm_loading = True
 
-    # Load tajweed annotations (if configured) before starting the model loader thread
     _load_tajweed()
 
     t = threading.Thread(target=_load_all_bg, daemon=True)
@@ -513,11 +500,7 @@ async def analyze_ayah(
     - decodes the full audio
     - approximates a time window around each span
     - crops each window and runs the existing SVM classifier on it
-
-    NOTE:
-    The current time mapping is a simple linear approximation over the ayah text
-    based on the span indices. For production, you should replace this with a
-    proper ASR + alignment pipeline to get precise timestamps.
+    - ويرجع كمان transcription لكل مقطع مقصوص (للدبج)
     """
     if load_error:
         raise HTTPException(status_code=500, detail=f"Model load failed: {load_error}")
@@ -573,7 +556,7 @@ async def analyze_ayah(
             end_idx = start_idx
 
         center_idx = 0.5 * (start_idx + end_idx)
-        # simple linear mapping: character position -> time within the ayah
+        # simple linear mapping: character/token position -> time within the ayah
         core_time = (center_idx / float(max_end)) * duration
 
         # expand with margins to be safe
@@ -593,19 +576,27 @@ async def analyze_ayah(
         start_sample = int(t_start * sample_rate)
         end_sample = int(t_end * sample_rate)
         seg_wav = wav[start_sample:end_sample]
-        # ensure the cropped segment is still valid
         seg_wav = _ensure_audio_ok(seg_wav)
 
-        # 3) classify this segment with the existing SVM pipeline
+        # 3) classify this segment with the existing SVM pipeline + transcription
         inputs = processor(seg_wav, sampling_rate=sample_rate, return_tensors="pt", padding=True)
+
         with torch.no_grad():
             out = model(
                 inputs.input_values.to(device),
                 output_hidden_states=True,
                 return_dict=True,
             )
-        emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)
-        emb = emb_t.detach().cpu().numpy().astype(np.float32)
+
+            # (a) transcription لنفس المقطع المقصوص
+            logits = out.logits
+            pred_ids = torch.argmax(logits, dim=-1)
+            segment_text = processor.batch_decode(pred_ids)[0]
+
+            # (b) embedding للـ SVM
+            emb_t = _extract_embedding_mean_std(out.hidden_states, EMB_LAYER)
+            emb = emb_t.detach().cpu().numpy().astype(np.float32)
+
         raw_label, conf = _svm_predict_with_confidence(emb)
         label = _map_label(raw_label)
 
@@ -621,6 +612,7 @@ async def analyze_ayah(
                 "label": label,
                 "raw_label": str(raw_label),
                 "confidence": float(conf),
+                "transcription": segment_text,  # النص اللي سمعه الموديل في هذا المقطع
             }
         )
 
